@@ -154,26 +154,41 @@ class AlignmentEngine:
             start_frame = transition_frames[start_idx]['time_index']
             start_time = round(start_frame * ratio, 3)
             
-            # End time is the start of the NEXT word, or a buffer after the last token
-            if i < len(words) - 1:
-                next_start_idx = word_token_spans[i + 1][0]
-                end_frame = transition_frames[next_start_idx]['time_index']
+            # The token that immediately follows the word's last token
+            # determines when the word's last token ends.
+            if end_idx + 1 < len(transition_frames):
+                end_frame = transition_frames[end_idx + 1]['time_index']
                 end_time = round(end_frame * ratio, 3)
+                
+                if i < len(words) - 1:
+                    next_start_idx = word_token_spans[i + 1][0]
+                    next_start_time = round(transition_frames[next_start_idx]['time_index'] * ratio, 3)
+                    
+                    gap = next_start_time - end_time
+                    if gap > 0:
+                        # There is a delimiter gap. Add a tiny buffer to capture trailing breath/sound
+                        end_time += min(gap, 0.05)
+                    else:
+                        # Contiguous (no delimiter). Pull back slightly to prevent bleeding!
+                        end_time -= 0.03
+                else:
+                    end_time += 0.05
             else:
-                # Last word: take the transition of its last token + some buffer
+                # Last word and no tokens follow it
                 end_frame = transition_frames[end_idx]['time_index']
-                end_time = round((end_frame + 20) * ratio, 3)  # roughly 400ms buffer
-                if end_time > total_duration:
-                    end_time = total_duration
+                end_time = round((end_frame + 10) * ratio, 3)  # approx 200ms
             
             # Ensure boundaries are logical
+            if end_time > total_duration:
+                end_time = total_duration
+                
             if end_time <= start_time:
                 end_time = start_time + 0.1
                 
             word_alignments.append({
                 "word": word,
-                "start": start_time,
-                "end": end_time,
+                "start": round(start_time, 3),
+                "end": round(end_time, 3),
                 "confidence": 0.9  # Fixed confidence for simplicity as it's not strictly needed
             })
         
@@ -353,10 +368,25 @@ class AlignmentEngine:
             chunks = [{"timestamp": (w["start"], w["end"]), "text": w["text"]} for w in whisper_words]
             word_alignments = self._match_whisper_to_reference(chunks, ref_words)
         
-        # Ensure contiguous timestamps (no gaps)
+        # Adjust timestamps to prevent bleeding and preserve natural gaps
         for i in range(len(word_alignments) - 1):
-            if word_alignments[i]["end"] < word_alignments[i + 1]["start"]:
-                word_alignments[i]["end"] = word_alignments[i + 1]["start"]
+            gap = word_alignments[i + 1]["start"] - word_alignments[i]["end"]
+            if gap > 0:
+                # Add a small buffer to the end of the current word to catch trailing sounds
+                word_alignments[i]["end"] += min(gap, 0.05)
+            elif gap < 0:
+                # Overlap! Fix it by setting end to next start minus a tiny margin
+                word_alignments[i]["end"] = word_alignments[i + 1]["start"] - 0.02
+            else:
+                # Contiguous. Pull back slightly to prevent bleeding into next word
+                word_alignments[i]["end"] -= 0.03
+                
+            # Ensure start is strictly before end
+            if word_alignments[i]["end"] <= word_alignments[i]["start"]:
+                word_alignments[i]["end"] = word_alignments[i]["start"] + 0.05
+            
+            # Round values
+            word_alignments[i]["end"] = round(word_alignments[i]["end"], 3)
         
         # Log final alignments
         print(f"[Whisper] Generated {len(word_alignments)} word timestamps:")
