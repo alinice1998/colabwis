@@ -5,6 +5,9 @@ import numpy as np
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 from typing import List, Dict
+import gc
+import librosa
+from rapidfuzz import fuzz
 
 class AlignmentEngine:
     def __init__(self, whisper_path: str, wav2vec2_path: str):
@@ -198,6 +201,120 @@ class AlignmentEngine:
             print(f"  {wa['word']}: {wa['start']}s - {wa['end']}s (conf: {wa['confidence']})")
         
         return word_alignments
+
+    def align_smart(self, audio_path: str, reference_text: str) -> List[Dict]:
+        """Performs smart forced alignment by splitting long audio at silences."""
+        if not self.wav2vec2_model:
+            self.load_models()
+
+        print(f"[SmartAlign] Loading audio: {audio_path}")
+        speech, sr = sf.read(audio_path, dtype='float32')
+        if len(speech.shape) > 1:
+            speech = speech.mean(axis=1)
+        
+        if sr != 16000:
+            speech = librosa.resample(speech, orig_sr=sr, target_sr=16000)
+            sr = 16000
+
+        duration = len(speech) / sr
+        print(f"[SmartAlign] Duration: {duration:.2f}s")
+
+        # If short enough, use standard alignment
+        if duration < 35:
+            return self.align(audio_path, reference_text)
+
+        # 1. Get rough word timestamps using Whisper (more memory efficient for long files)
+        print("[SmartAlign] Step 1: Getting rough timestamps with Whisper...")
+        rough_alignments = self.align_whisper(audio_path, reference_text)
+        
+        if not rough_alignments:
+            print("[SmartAlign] Whisper failed, falling back to basic chunking")
+            return self.align(audio_path, reference_text)
+
+        # 2. Identify "Safe" split points (silences between Ayahs/words)
+        print("[SmartAlign] Step 2: Identifying split points...")
+        max_chunk_len = 30
+        chunks = []
+        current_ref_words = []
+        current_chunk_start_time = 0
+        current_chunk_start_word_idx = 0
+        
+        ref_words = reference_text.split()
+        
+        # We'll group words into chunks of ~30 seconds
+        for i, wa in enumerate(rough_alignments):
+            current_ref_words.append(wa['word'])
+            
+            # Check if we should split here
+            # Split if we reached max_chunk_len AND we are at a word boundary
+            if (wa['end'] - current_chunk_start_time) > max_chunk_len or i == len(rough_alignments) - 1:
+                chunk_end_time = wa['end']
+                # If not the last word, try to find a gap after this word
+                if i < len(rough_alignments) - 1:
+                    gap = rough_alignments[i+1]['start'] - wa['end']
+                    if gap > 0.1: # Significant enough gap
+                        chunk_end_time += gap / 2
+                
+                # Add a tiny bit of buffer
+                chunk_end_time = min(chunk_end_time + 0.2, duration)
+                
+                chunks.append({
+                    "start_time": current_chunk_start_time,
+                    "end_time": chunk_end_time,
+                    "words": current_ref_words.copy()
+                })
+                
+                current_chunk_start_time = chunk_end_time
+                current_chunk_start_word_idx = i + 1
+                current_ref_words = []
+
+        # 3. Process each chunk with high-precision CTC
+        print(f"[SmartAlign] Step 3: Processing {len(chunks)} chunks with CTC...")
+        final_alignments = []
+        
+        # Save original speech to avoid reloading
+        full_speech = speech
+        
+        for i, chunk in enumerate(chunks):
+            print(f"  Processing chunk {i+1}/{len(chunks)}: {chunk['start_time']:.2f}s - {chunk['end_time']:.2f}s ({len(chunk['words'])} words)")
+            
+            # Extract audio segment
+            start_sample = int(chunk['start_time'] * sr)
+            end_sample = int(chunk['end_time'] * sr)
+            chunk_speech = full_speech[start_sample:end_sample]
+            
+            if len(chunk_speech) == 0:
+                continue
+                
+            # Temporary file for the chunk
+            chunk_tmp_path = f"{audio_path}_chunk_{i}.wav"
+            sf.write(chunk_tmp_path, chunk_speech, sr)
+            
+            try:
+                chunk_text = " ".join(chunk["words"])
+                chunk_alignments = self.align(chunk_tmp_path, chunk_text)
+                
+                # Adjust timestamps with chunk offset
+                for ca in chunk_alignments:
+                    ca['start'] = round(ca['start'] + chunk['start_time'], 3)
+                    ca['end'] = round(ca['end'] + chunk['start_time'], 3)
+                    final_alignments.append(ca)
+                    
+            except Exception as e:
+                print(f"  [SmartAlign] Error in chunk {i}: {e}")
+                # Fallback to rough alignments for this chunk if CTC fails
+                start_idx = sum(len(c['words']) for c in chunks[:i])
+                for j in range(len(chunk['words'])):
+                    final_alignments.append(rough_alignments[start_idx + j])
+            finally:
+                if os.path.exists(chunk_tmp_path):
+                    os.remove(chunk_tmp_path)
+                
+                # Memory management
+                torch.cuda.empty_cache()
+                gc.collect()
+
+        return final_alignments
 
     def align_whisper(self, audio_path: str, reference_text: str) -> List[Dict]:
         """Uses Whisper's built-in word-level timestamps via cross-attention weights.

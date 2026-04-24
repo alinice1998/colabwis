@@ -36,7 +36,7 @@ async def align_cloud(
         if method == "whisper":
             alignments = alignment_engine.align_whisper(file_path, reference_text)
         else:
-            alignments = alignment_engine.align(file_path, reference_text)
+            alignments = alignment_engine.align_smart(file_path, reference_text)
             
         return JSONResponse({
             "status": "success",
