@@ -78,35 +78,12 @@ class AlignmentEngine:
         
         audio_tensor = torch.from_numpy(speech).to(self.device)
         
-        # Get emissions with chunking to prevent CUDA OOM
-        chunk_size_seconds = 30
-        chunk_length = chunk_size_seconds * 16000
-        all_logits = []
-        
+        # Get emissions
         with torch.inference_mode():
-            for i in range(0, len(audio_tensor), chunk_length):
-                chunk = audio_tensor[i:i + chunk_length]
-                
-                # Wav2Vec2 CNN requires a minimum length (approx 400 samples)
-                if len(chunk) < 400:
-                    chunk = torch.nn.functional.pad(chunk, (0, 400 - len(chunk)))
-                    
-                chunk_logits = self.wav2vec2_model(chunk.unsqueeze(0)).logits
-                
-                # Move to CPU immediately to free GPU memory
-                all_logits.append(chunk_logits.cpu())
-                
-                # Free GPU memory
-                del chunk_logits
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                
-            # Concatenate all logits chunks along the time dimension (dim=1)
-            logits = torch.cat(all_logits, dim=1)
-            # Compute log_softmax on CPU
+            logits = self.wav2vec2_model(audio_tensor.unsqueeze(0)).logits
             emissions = torch.log_softmax(logits, dim=-1)
         
-        emission = emissions[0].detach()
+        emission = emissions[0].cpu().detach()
         
         # Build tokens array from reference text
         words = reference_text.split()
