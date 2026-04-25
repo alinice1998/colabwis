@@ -94,23 +94,39 @@ class AlignmentEngine:
 
         audio_tensor = torch.from_numpy(speech).to(self.device)
 
-        # ── Process in 30-second chunks to avoid CUDA OOM ────────────────────
+        # ── Process in 30-second chunks with overlap to avoid CUDA OOM ─────────
         chunk_size_seconds = 30
-        chunk_length = chunk_size_seconds * 16000
-        all_logits = []
+        overlap_seconds    = 2        # 2s overlap to avoid cutting madd letters
+        chunk_length       = chunk_size_seconds * 16000
+        overlap_length     = overlap_seconds * 16000
+        step_length        = chunk_length - overlap_length
+        all_logits         = []
 
         with torch.inference_mode():
-            for i in range(0, len(audio_tensor), chunk_length):
-                chunk = audio_tensor[i: i + chunk_length]
+            pos = 0
+            while pos < len(audio_tensor):
+                chunk = audio_tensor[pos: pos + chunk_length]
                 if len(chunk) < 400:
                     chunk = torch.nn.functional.pad(chunk, (0, 400 - len(chunk)))
 
                 chunk_logits = self.wav2vec2_model(chunk.unsqueeze(0)).logits
+
+                # Drop overlapping frames from previous chunk (except first)
+                if pos > 0:
+                    overlap_frames = int(
+                        chunk_logits.shape[1] * overlap_length / len(chunk)
+                    )
+                    chunk_logits = chunk_logits[:, overlap_frames:, :]
+
                 all_logits.append(chunk_logits.cpu())
 
                 del chunk_logits
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+
+                if pos + chunk_length >= len(audio_tensor):
+                    break
+                pos += step_length
 
             logits = torch.cat(all_logits, dim=1)
             emissions = torch.log_softmax(logits, dim=-1)
@@ -203,12 +219,21 @@ class AlignmentEngine:
                     gap = next_start_time - end_time
                     end_time += min(gap, 0.05) if gap > 0 else -0.03
                 else:
-                    end_time += 0.05
+                    # Last word: extend to the actual audio end (covers long madd)
+                    end_time = total_duration
             else:
-                end_frame = transition_frames[end_idx]['time_index']
-                end_time = round((end_frame + 10) * ratio, 3)
+                if i == len(words) - 1:
+                    # Last word with no next transition: use full audio end
+                    end_time = total_duration
+                else:
+                    end_frame = transition_frames[end_idx]['time_index']
+                    end_time = round((end_frame + 10) * ratio, 3)
 
-            end_time = min(end_time, total_duration)
+            # For the last word, always ensure it reaches the audio end
+            if i == len(words) - 1:
+                end_time = total_duration
+            else:
+                end_time = min(end_time, total_duration)
             if end_time <= start_time:
                 end_time = start_time + 0.1
 
