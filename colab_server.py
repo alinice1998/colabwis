@@ -6,11 +6,21 @@ import shutil
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import soundfile as sf
 from alignment_engine import AlignmentEngine
 
 app = FastAPI(title="Miqat Colab Alignment Server")
+
+# Allow browser direct uploads (bypass local proxy for large audio files)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 WHISPER_PATH = "model_local/whisper"
 WAV2VEC2_PATH = "model_local/wav2vec2"
