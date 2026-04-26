@@ -42,9 +42,8 @@ _executor = ThreadPoolExecutor(max_workers=1)
 
 
 # ─── Background processing ────────────────────────────────────────────────────
-def _run_job(job_id: str, file_path: str, reference_text: str, method: str, resume_time: float = 0.0):
+def _run_job(job_id: str, file_path: str, reference_text: str, method: str):
     """Runs in a background thread. Updates jobs[job_id] when done."""
-    file_path_to_process = file_path
     try:
         jobs[job_id]["status"] = "processing"
 
@@ -52,44 +51,26 @@ def _run_job(job_id: str, file_path: str, reference_text: str, method: str, resu
         speech, sr = sf.read(file_path, dtype='float32')
         if len(speech.shape) > 1:
             speech = speech.mean(axis=1)
-
-        if resume_time > 0:
-            start_sample = int(resume_time * sr)
-            if start_sample < len(speech):
-                speech = speech[start_sample:]
-                file_path_to_process = f"temp_audio/sliced_{job_id}.wav"
-                sf.write(file_path_to_process, speech, sr)
-            else:
-                raise ValueError("resume_time exceeds audio length")
-
         duration = len(speech) / sr
         del speech  # free RAM immediately
 
-        print(f"[Job {job_id[:8]}] method={method}, duration={duration:.1f}s, resume_time={resume_time}s")
-
-        def handle_progress(partial):
-            if resume_time > 0:
-                adjusted = []
-                for p in partial:
-                    adjusted.append({**p, "start": round(p["start"] + resume_time, 3), "end": round(p["end"] + resume_time, 3)})
-                jobs[job_id]["alignments"] = adjusted
-            else:
-                jobs[job_id]["alignments"] = partial
+        print(f"[Job {job_id[:8]}] method={method}, duration={duration:.1f}s")
 
         if method == "whisper":
-            alignments = alignment_engine.align_whisper(file_path_to_process, reference_text)
-            handle_progress(alignments)
+            alignments = alignment_engine.align_whisper(file_path, reference_text)
         elif duration > 35:
             # Long audio: chunked smart alignment
-            alignments = alignment_engine.align_smart(file_path_to_process, reference_text, progress_cb=handle_progress)
-            handle_progress(alignments)
+            alignments = alignment_engine.align_smart(file_path, reference_text)
         else:
             # Short audio: direct CTC
-            alignments = alignment_engine.align(file_path_to_process, reference_text)
-            handle_progress(alignments)
+            alignments = alignment_engine.align(file_path, reference_text)
 
-        jobs[job_id]["status"] = "done"
-        jobs[job_id]["method"] = method
+        jobs[job_id] = {
+            "status": "done",
+            "method": method,
+            "alignments": alignments,
+            "error": None,
+        }
         print(f"[Job {job_id[:8]}] ✓ done — {len(alignments)} words")
 
     except Exception as e:
@@ -105,8 +86,6 @@ def _run_job(job_id: str, file_path: str, reference_text: str, method: str, resu
     finally:
         if os.path.exists(file_path):
             os.remove(file_path)
-        if file_path_to_process != file_path and os.path.exists(file_path_to_process):
-            os.remove(file_path_to_process)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         gc.collect()
@@ -120,7 +99,6 @@ async def align_cloud(
     file: UploadFile = File(...),
     reference_text: str = Form(...),
     method: str = Form(...),
-    resume_time: float = Form(0.0),
 ):
     """
     Accepts an audio file and returns a job_id immediately.
@@ -143,7 +121,7 @@ async def align_cloud(
 
     # Submit to background thread (non-blocking — no timeout risk)
     background_tasks.add_task(
-        lambda: _executor.submit(_run_job, job_id, file_path, reference_text, method, resume_time)
+        lambda: _executor.submit(_run_job, job_id, file_path, reference_text, method)
     )
 
     return JSONResponse({
@@ -182,7 +160,6 @@ async def get_job_status(job_id: str):
         return JSONResponse({
             "status": job["status"],
             "message": "Still processing — try again in a few seconds.",
-            "partial_alignments": job.get("alignments") or [],
         })
 
 

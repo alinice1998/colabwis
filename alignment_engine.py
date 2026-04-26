@@ -443,7 +443,7 @@ class AlignmentEngine:
 
     # ─── Smart alignment for long audio ──────────────────────────────────────
 
-    def align_smart(self, audio_path: str, reference_text: str, progress_cb=None) -> List[Dict]:
+    def align_smart(self, audio_path: str, reference_text: str) -> List[Dict]:
         """
         For audio > 35s:
           1. Get rough word timestamps via Whisper (chunked).
@@ -539,9 +539,6 @@ class AlignmentEngine:
                     ca['start'] = round(ca['start'] + chunk['start_time'], 3)
                     ca['end']   = round(ca['end']   + chunk['start_time'], 3)
                     final_alignments.append(ca)
-
-                if progress_cb:
-                    progress_cb(list(final_alignments))
 
             except Exception as e:
                 print(f"  [SmartAlign] CTC failed on chunk {idx}: {e} — using Whisper fallback")
