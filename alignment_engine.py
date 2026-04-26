@@ -438,11 +438,11 @@ class AlignmentEngine:
 
     def align_smart(self, audio_path: str, reference_text: str) -> List[Dict]:
         """
-        For audio > 35s:
-          1. Get rough word timestamps via Whisper (chunked).
-          2. Split audio at those boundaries into ≤30s segments.
-          3. Refine each segment with high-precision CTC.
-        Falls back gracefully to the rough Whisper timestamps on any CTC failure.
+        For long audio:
+          Uses a Sliding Window approach purely on CPU to split audio into 5-minute chunks
+          with overlap. It passes enough text to each chunk to ensure valid alignments,
+          dropping squished words at the end, and advancing the text pointer.
+          Avoids Whisper entirely to prevent CUDA OOM on long files.
         """
         if not self.wav2vec2_model:
             self.load_models()
@@ -458,85 +458,96 @@ class AlignmentEngine:
         duration = len(speech) / sr
         print(f"[SmartAlign] Duration: {duration:.2f}s")
 
-        if duration < 35:
+        if duration < 60 * 7: # If less than 7 minutes, direct CTC is safe
+            print("[SmartAlign] File is short enough for direct CTC alignment.")
             return self.align(audio_path, reference_text)
 
-        # ── Step 1: rough timestamps from Whisper ─────────────────────────────
-        print("[SmartAlign] Step 1: Getting rough timestamps with Whisper...")
-        rough = self.align_whisper(audio_path, reference_text)
+        # Sliding window parameters
+        chunk_sec = 300.0       # 5 minutes
+        overlap_sec = 30.0      # 30 seconds overlap
+        step_sec = chunk_sec - overlap_sec
 
-        if not rough:
-            print("[SmartAlign] Whisper failed — falling back to direct CTC")
-            return self.align(audio_path, reference_text)
+        ref_words = reference_text.split()
+        total_words = len(ref_words)
+        words_per_sec = total_words / duration
+        
+        # Provide 3-4x the expected words to guarantee we have enough text for the chunk.
+        # CTC will squish the unused words at the very end.
+        words_per_chunk = max(int(chunk_sec * words_per_sec * 4.0), 1000)
 
-        # ── Step 2: build ≤30s chunks from rough timestamps ───────────────────
-        print("[SmartAlign] Step 2: Building chunks from Whisper boundaries...")
-        MAX_CHUNK_SEC = 28
-        chunks = []
-        current_words = []
-        chunk_start = 0.0
-
-        for i, wa in enumerate(rough):
-            current_words.append(wa['word'])
-            elapsed = wa['end'] - chunk_start
-            is_last = (i == len(rough) - 1)
-
-            if elapsed >= MAX_CHUNK_SEC or is_last:
-                # Try to find a natural gap just after this word
-                chunk_end = wa['end']
-                if not is_last:
-                    gap = rough[i + 1]['start'] - wa['end']
-                    if gap > 0.05:
-                        chunk_end += gap / 2
-                chunk_end = min(chunk_end + 0.15, duration)
-
-                chunks.append({
-                    "start_time": chunk_start,
-                    "end_time":   chunk_end,
-                    "words":      current_words.copy(),
-                    "rough_alignments": rough[
-                        i - len(current_words) + 1: i + 1
-                    ],
-                })
-                chunk_start = chunk_end
-                current_words = []
-
-        # ── Step 3: refine each chunk with CTC ───────────────────────────────
-        print(f"[SmartAlign] Step 3: Refining {len(chunks)} chunks with CTC...")
         final_alignments = []
+        current_word_idx = 0
+        pos_sec = 0.0
 
-        for idx, chunk in enumerate(chunks):
-            print(
-                f"  Chunk {idx + 1}/{len(chunks)}: "
-                f"{chunk['start_time']:.2f}s – {chunk['end_time']:.2f}s "
-                f"({len(chunk['words'])} words)"
-            )
-
-            start_sample = int(chunk['start_time'] * sr)
-            end_sample   = int(chunk['end_time'] * sr)
-            chunk_speech = speech[start_sample:end_sample]
-
-            if len(chunk_speech) < 400:
-                # Too short for CTC — use rough timestamps
-                final_alignments.extend(chunk['rough_alignments'])
-                continue
-
-            chunk_tmp = f"{audio_path}_chunk_{idx}.wav"
+        while pos_sec < duration and current_word_idx < total_words:
+            end_sec = min(pos_sec + chunk_sec, duration)
+            is_last_chunk = (end_sec == duration)
+            
+            chunk_start_sample = int(pos_sec * sr)
+            chunk_end_sample = int(end_sec * sr)
+            chunk_speech = speech[chunk_start_sample:chunk_end_sample]
+            
+            # Determine words to pass
+            chunk_words_end = min(current_word_idx + words_per_chunk, total_words)
+            if is_last_chunk:
+                chunk_words_end = total_words
+                
+            chunk_text = " ".join(ref_words[current_word_idx:chunk_words_end])
+            
+            print(f"[SmartAlign] Chunk {pos_sec:.1f}s - {end_sec:.1f}s | Words {current_word_idx} to {chunk_words_end}")
+            
+            # Save temp audio for self.align
+            chunk_tmp = f"{audio_path}_temp.wav"
             sf.write(chunk_tmp, chunk_speech, sr)
-
+            
             try:
-                chunk_text = " ".join(chunk["words"])
+                # align returns alignments relative to the chunk (0.0 to chunk_duration)
                 ctc_result = self.align(chunk_tmp, chunk_text)
-
-                for ca in ctc_result:
-                    ca['start'] = round(ca['start'] + chunk['start_time'], 3)
-                    ca['end']   = round(ca['end']   + chunk['start_time'], 3)
-                    final_alignments.append(ca)
-
+                
+                valid_alignments = []
+                last_valid_idx = current_word_idx - 1
+                
+                # Cutoff slightly before the end to avoid the "squished" words
+                cutoff_sec = (end_sec - pos_sec) - (overlap_sec / 2.0)
+                
+                for i, wa in enumerate(ctc_result):
+                    global_start = round(wa['start'] + pos_sec, 3)
+                    global_end   = round(wa['end']   + pos_sec, 3)
+                    
+                    if not is_last_chunk and wa['end'] > cutoff_sec:
+                        # Stop adding words if they fall into the tail region
+                        if len(valid_alignments) > 0:
+                            break
+                    
+                    wa['start'] = global_start
+                    wa['end']   = global_end
+                    valid_alignments.append(wa)
+                    last_valid_idx = current_word_idx + i
+                    
+                final_alignments.extend(valid_alignments)
+                
+                if not valid_alignments:
+                    print("[SmartAlign] WARNING: No valid words found in chunk. Advancing by step_sec.")
+                    pos_sec += step_sec
+                    continue
+                    
+                # Advance variables for next chunk
+                current_word_idx = last_valid_idx + 1
+                
+                # Next audio chunk should start slightly before the last valid word ends
+                next_start_sec = max(pos_sec, final_alignments[-1]['end'] - (overlap_sec / 2.0))
+                
+                # Ensure we always advance at least a little bit to avoid infinite loop
+                if next_start_sec <= pos_sec:
+                    next_start_sec = pos_sec + (overlap_sec / 2.0)
+                    
+                pos_sec = next_start_sec
+                
             except Exception as e:
-                print(f"  [SmartAlign] CTC failed on chunk {idx}: {e} — using Whisper fallback")
-                final_alignments.extend(chunk['rough_alignments'])
-
+                print(f"[SmartAlign] Error in chunk: {e}")
+                # Fallback: advance blindly
+                pos_sec += step_sec
+                
             finally:
                 if os.path.exists(chunk_tmp):
                     os.remove(chunk_tmp)
